@@ -1,4 +1,6 @@
 import base64
+import json
+import os
 import sys
 import threading
 import time
@@ -9,11 +11,11 @@ import obsws_python as obs
 from PIL import Image, ImageTk
 
 # ==========================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES (FALLBACK CASO NÃO ENCONTRE O OBS)
 # ==========================================
 OBS_HOST = "localhost"
-OBS_PORT = 4455
-OBS_PASSWORD = "123456"
+OBS_PORT_PADRAO = 4455
+OBS_PASSWORD_PADRAO = "123456"
 
 PREVIEW_LARGURA = 160
 PREVIEW_ALTURA = 90
@@ -33,6 +35,26 @@ COR_BOTAO_ATIVO_HOVER = "#15803d"
 COR_TEXTO = "#f4f4f5"
 COR_TEXTO_MUTED = "#a1a1aa"
 COR_STATUS_OFFLINE = "#ef4444"
+
+
+def carregar_config_obs() -> tuple[str, int, str, bool]:
+    """Lê porta e senha diretamente do config.json do obs-websocket no Windows."""
+    appdata = os.environ.get("APPDATA", "")
+    caminho_cfg = os.path.join(
+        appdata, "obs-studio", "plugin_config", "obs-websocket", "config.json"
+    )
+    if os.path.isfile(caminho_cfg):
+        try:
+            with open(caminho_cfg, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+            habilitado = bool(dados.get("server_enabled", True))
+            porta = int(dados.get("server_port", OBS_PORT_PADRAO))
+            exige_auth = bool(dados.get("auth_required", True))
+            senha = str(dados.get("server_password", "")) if exige_auth else ""
+            return OBS_HOST, porta, senha, habilitado
+        except Exception:
+            pass
+    return OBS_HOST, OBS_PORT_PADRAO, OBS_PASSWORD_PADRAO, True
 
 
 class PainelOBS:
@@ -98,23 +120,29 @@ class PainelOBS:
         pos_y = max(0, altura_tela - altura_janela - MARGEM_Y)
         self.root.geometry(f"+{pos_x}+{pos_y}")
 
-    def _conectar_obs(self) -> bool:
-        """Tenta estabelecer conexões separadas para preview e comandos."""
+    def _conectar_obs(self) -> tuple[bool, bool]:
+        """Tenta estabelecer conexões separadas para preview e comandos.
+        Retorna (conectado, websocket_habilitado).
+        """
         self._desconectar_obs()
+        host, porta, senha, habilitado = carregar_config_obs()
+        if not habilitado:
+            return False, False
+
+        kwargs = {"host": host, "port": porta, "timeout": 3}
+        if senha:
+            kwargs["password"] = senha
+
         try:
-            cl_prev = obs.ReqClient(
-                host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD, timeout=3
-            )
-            cl_cmd = obs.ReqClient(
-                host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD, timeout=3
-            )
+            cl_prev = obs.ReqClient(**kwargs)
+            cl_cmd = obs.ReqClient(**kwargs)
             self._cl_preview = cl_prev
             self._cl_comando = cl_cmd
             self._conectado = True
-            return True
+            return True, True
         except Exception:
             self._desconectar_obs()
-            return False
+            return False, True
 
     def _desconectar_obs(self):
         self._conectado = False
@@ -135,11 +163,17 @@ class PainelOBS:
         while self._executando:
             if not self._conectado:
                 self._agendar_ui(lambda: self._mostrar_status("Conectando ao OBS...", COR_TEXTO_MUTED))
-                if not self._conectar_obs():
+                conectado, ws_habilitado = self._conectar_obs()
+                if not conectado:
                     if self._fechar_ao_desconectar and self._ja_conectou:
                         self._agendar_ui(self.ao_fechar)
                         return
-                    self._agendar_ui(lambda: self._mostrar_status("OBS offline", COR_STATUS_OFFLINE))
+                    msg = (
+                        "OBS offline"
+                        if ws_habilitado
+                        else "Ative o WebSocket\nno OBS (Ferramentas)"
+                    )
+                    self._agendar_ui(lambda m=msg: self._mostrar_status(m, COR_STATUS_OFFLINE))
                     time.sleep(RECONEXAO_SEGUNDOS)
                     continue
                 self._ja_conectou = True
@@ -185,7 +219,8 @@ class PainelOBS:
                 self._desconectar_obs()
                 if self._fechar_ao_desconectar and self._ja_conectou:
                     time.sleep(0.8)
-                    if not self._conectar_obs():
+                    conectado, _ = self._conectar_obs()
+                    if not conectado:
                         self._agendar_ui(self.ao_fechar)
                         return
                 continue
